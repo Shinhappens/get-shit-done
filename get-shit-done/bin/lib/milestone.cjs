@@ -4,9 +4,9 @@
 
 const fs = require('fs');
 const path = require('path');
-const { escapeRegex, getMilestonePhaseFilter, normalizeMd, output, error } = require('./core.cjs');
+const { escapeRegex, getMilestonePhaseFilter, extractOneLinerFromBody, normalizeMd, planningPaths, output, error } = require('./core.cjs');
 const { extractFrontmatter } = require('./frontmatter.cjs');
-const { writeStateMd } = require('./state.cjs');
+const { writeStateMd, stateReplaceFieldWithFallback } = require('./state.cjs');
 
 function cmdRequirementsMarkComplete(cwd, reqIdsRaw, raw) {
   if (!reqIdsRaw || reqIdsRaw.length === 0) {
@@ -25,7 +25,7 @@ function cmdRequirementsMarkComplete(cwd, reqIdsRaw, raw) {
     error('no valid requirement IDs found');
   }
 
-  const reqPath = path.join(cwd, '.planning', 'REQUIREMENTS.md');
+  const reqPath = planningPaths(cwd).requirements;
   if (!fs.existsSync(reqPath)) {
     output({ updated: false, reason: 'REQUIREMENTS.md not found', ids: reqIds }, raw, 'no requirements file');
     return;
@@ -41,29 +41,30 @@ function cmdRequirementsMarkComplete(cwd, reqIdsRaw, raw) {
     const reqEscaped = escapeRegex(reqId);
 
     // Update checkbox: - [ ] **REQ-ID** → - [x] **REQ-ID**
+    // Use replace() directly and compare — avoids test()+replace() global regex
+    // lastIndex bug where test() advances state and replace() misses matches.
     const checkboxPattern = new RegExp(`(-\\s*\\[)[ ](\\]\\s*\\*\\*${reqEscaped}\\*\\*)`, 'gi');
-    if (checkboxPattern.test(reqContent)) {
-      reqContent = reqContent.replace(checkboxPattern, '$1x$2');
+    const afterCheckbox = reqContent.replace(checkboxPattern, '$1x$2');
+    if (afterCheckbox !== reqContent) {
+      reqContent = afterCheckbox;
       found = true;
     }
 
     // Update traceability table: | REQ-ID | Phase N | Pending | → | REQ-ID | Phase N | Complete |
     const tablePattern = new RegExp(`(\\|\\s*${reqEscaped}\\s*\\|[^|]+\\|)\\s*Pending\\s*(\\|)`, 'gi');
-    if (tablePattern.test(reqContent)) {
-      // Re-read since test() advances lastIndex for global regex
-      reqContent = reqContent.replace(
-        new RegExp(`(\\|\\s*${reqEscaped}\\s*\\|[^|]+\\|)\\s*Pending\\s*(\\|)`, 'gi'),
-        '$1 Complete $2'
-      );
+    const afterTable = reqContent.replace(tablePattern, '$1 Complete $2');
+    if (afterTable !== reqContent) {
+      reqContent = afterTable;
       found = true;
     }
 
     if (found) {
       updated.push(reqId);
     } else {
-      // Check if already complete before declaring not_found
-      const doneCheckbox = new RegExp(`-\\s*\\[x\\]\\s*\\*\\*${reqEscaped}\\*\\*`, 'gi');
-      const doneTable = new RegExp(`\\|\\s*${reqEscaped}\\s*\\|[^|]+\\|\\s*Complete\\s*\\|`, 'gi');
+      // Check if already complete before declaring not_found.
+      // Non-global flag is fine here — we only need to know if a match exists.
+      const doneCheckbox = new RegExp(`-\\s*\\[x\\]\\s*\\*\\*${reqEscaped}\\*\\*`, 'i');
+      const doneTable = new RegExp(`\\|\\s*${reqEscaped}\\s*\\|[^|]+\\|\\s*Complete\\s*\\|`, 'i');
       if (doneCheckbox.test(reqContent) || doneTable.test(reqContent)) {
         alreadyComplete.push(reqId);
       } else {
@@ -90,12 +91,12 @@ function cmdMilestoneComplete(cwd, version, options, raw) {
     error('version required for milestone complete (e.g., v1.0)');
   }
 
-  const roadmapPath = path.join(cwd, '.planning', 'ROADMAP.md');
-  const reqPath = path.join(cwd, '.planning', 'REQUIREMENTS.md');
-  const statePath = path.join(cwd, '.planning', 'STATE.md');
+  const roadmapPath = planningPaths(cwd).roadmap;
+  const reqPath = planningPaths(cwd).requirements;
+  const statePath = planningPaths(cwd).state;
   const milestonesPath = path.join(cwd, '.planning', 'MILESTONES.md');
   const archiveDir = path.join(cwd, '.planning', 'milestones');
-  const phasesDir = path.join(cwd, '.planning', 'phases');
+  const phasesDir = planningPaths(cwd).phases;
   const today = new Date().toISOString().split('T')[0];
   const milestoneName = options.name || version;
 
@@ -131,16 +132,24 @@ function cmdMilestoneComplete(cwd, version, options, raw) {
         try {
           const content = fs.readFileSync(path.join(phasesDir, dir, s), 'utf-8');
           const fm = extractFrontmatter(content);
-          if (fm['one-liner']) {
-            accomplishments.push(fm['one-liner']);
+          const oneLiner = fm['one-liner'] || extractOneLinerFromBody(content);
+          if (oneLiner) {
+            accomplishments.push(oneLiner);
           }
-          // Count tasks
-          const taskMatches = content.match(/##\s*Task\s*\d+/gi) || [];
-          totalTasks += taskMatches.length;
-        } catch {}
+          // Count tasks: prefer **Tasks:** N from Performance section,
+          // then <task XML tags, then ## Task N markdown headers
+          const tasksFieldMatch = content.match(/\*\*Tasks:\*\*\s*(\d+)/);
+          if (tasksFieldMatch) {
+            totalTasks += parseInt(tasksFieldMatch[1], 10);
+          } else {
+            const xmlTaskMatches = content.match(/<task[\s>]/gi) || [];
+            const mdTaskMatches = content.match(/##\s*Task\s*\d+/gi) || [];
+            totalTasks += xmlTaskMatches.length || mdTaskMatches.length;
+          }
+        } catch { /* intentionally empty */ }
       }
     }
-  } catch {}
+  } catch { /* intentionally empty */ }
 
   // Archive ROADMAP.md
   if (fs.existsSync(roadmapPath)) {
@@ -186,21 +195,15 @@ function cmdMilestoneComplete(cwd, version, options, raw) {
     fs.writeFileSync(milestonesPath, normalizeMd(`# Milestones\n\n${milestoneEntry}`), 'utf-8');
   }
 
-  // Update STATE.md
+  // Update STATE.md — use shared helpers that handle both **bold:** and plain Field: formats
   if (fs.existsSync(statePath)) {
     let stateContent = fs.readFileSync(statePath, 'utf-8');
-    stateContent = stateContent.replace(
-      /(\*\*Status:\*\*\s*).*/,
-      `$1${version} milestone complete`
-    );
-    stateContent = stateContent.replace(
-      /(\*\*Last Activity:\*\*\s*).*/,
-      `$1${today}`
-    );
-    stateContent = stateContent.replace(
-      /(\*\*Last Activity Description:\*\*\s*).*/,
-      `$1${version} milestone completed and archived`
-    );
+
+    stateContent = stateReplaceFieldWithFallback(stateContent, 'Status', null, `${version} milestone complete`);
+    stateContent = stateReplaceFieldWithFallback(stateContent, 'Last Activity', 'Last activity', today);
+    stateContent = stateReplaceFieldWithFallback(stateContent, 'Last Activity Description', null,
+      `${version} milestone completed and archived`);
+
     writeStateMd(statePath, stateContent, cwd);
   }
 
@@ -220,7 +223,7 @@ function cmdMilestoneComplete(cwd, version, options, raw) {
         archivedCount++;
       }
       phasesArchived = archivedCount > 0;
-    } catch {}
+    } catch { /* intentionally empty */ }
   }
 
   const result = {
@@ -244,7 +247,37 @@ function cmdMilestoneComplete(cwd, version, options, raw) {
   output(result, raw);
 }
 
+function cmdPhasesClear(cwd, raw, args) {
+  const phasesDir = planningPaths(cwd).phases;
+  const confirm = Array.isArray(args) && args.includes('--confirm');
+  let cleared = 0;
+
+  if (fs.existsSync(phasesDir)) {
+    const entries = fs.readdirSync(phasesDir, { withFileTypes: true });
+    const dirs = entries.filter(e => e.isDirectory() && !/^999(?:\.|$)/.test(e.name));
+
+    if (dirs.length > 0 && !confirm) {
+      error(
+        `phases clear would delete ${dirs.length} phase director${dirs.length === 1 ? 'y' : 'ies'}. ` +
+        `Pass --confirm to proceed.`
+      );
+    }
+
+    try {
+      for (const entry of dirs) {
+        fs.rmSync(path.join(phasesDir, entry.name), { recursive: true, force: true });
+        cleared++;
+      }
+    } catch (e) {
+      error('Failed to clear phases directory: ' + e.message);
+    }
+  }
+
+  output({ cleared }, raw, `${cleared} phase director${cleared === 1 ? 'y' : 'ies'} cleared`);
+}
+
 module.exports = {
   cmdRequirementsMarkComplete,
   cmdMilestoneComplete,
+  cmdPhasesClear,
 };
