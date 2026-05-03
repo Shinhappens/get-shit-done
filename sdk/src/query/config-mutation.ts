@@ -26,6 +26,7 @@ import { VALID_PROFILES, getAgentToModelMapForProfile } from './config-query.js'
 import { VALID_CONFIG_KEYS, DYNAMIC_KEY_PATTERNS } from './config-schema.js';
 import { planningPaths } from './helpers.js';
 import { acquireStateLock, releaseStateLock } from './state-mutation.js';
+import { maskIfSecret } from './secrets.js';
 import type { QueryHandler } from './utils.js';
 
 /**
@@ -186,7 +187,7 @@ function setConfigValue(obj: Record<string, unknown>, dotPath: string, value: un
  * @returns QueryResult matching gsd-tools `config-set` JSON: `{ updated, key, value, previousValue }`
  * @throws GSDError with Validation if key is invalid or args missing
  */
-export const configSet: QueryHandler = async (args, projectDir, _workstream) => {
+export const configSet: QueryHandler = async (args, projectDir, workstream) => {
   const keyPath = args[0];
   const rawValue = args[1];
   if (!keyPath) {
@@ -214,7 +215,7 @@ export const configSet: QueryHandler = async (args, projectDir, _workstream) => 
   }
 
   // D6: Lock protection for read-modify-write (match CJS config.cjs:296)
-  const paths = planningPaths(projectDir);
+  const paths = planningPaths(projectDir, workstream);
   const lockPath = await acquireStateLock(paths.config);
   let previousValue: unknown;
   try {
@@ -233,14 +234,17 @@ export const configSet: QueryHandler = async (args, projectDir, _workstream) => 
     await releaseStateLock(lockPath);
   }
 
-  // Match CJS JSON: `JSON.stringify` omits keys whose value is `undefined`
+  // Mask plaintext for keys in SECRET_CONFIG_KEYS to match CJS behavior at
+  // config.cjs:362-370 — without this, `gsd-sdk query config-set brave_search XXX`
+  // would echo the plaintext credential into machine-readable output. (#2997)
+  // The on-disk value is intentionally NOT masked — only the response.
   const data: Record<string, unknown> = {
     updated: true,
     key: keyPath,
-    value: parsedValue,
+    value: maskIfSecret(keyPath, parsedValue),
   };
   if (previousValue !== undefined) {
-    data.previousValue = previousValue;
+    data.previousValue = maskIfSecret(keyPath, previousValue);
   }
   return { data };
 };
@@ -255,7 +259,7 @@ export const configSet: QueryHandler = async (args, projectDir, _workstream) => 
  * @returns QueryResult with { set: true, profile, agents }
  * @throws GSDError with Validation if profile is invalid
  */
-export const configSetModelProfile: QueryHandler = async (args, projectDir, _workstream) => {
+export const configSetModelProfile: QueryHandler = async (args, projectDir, workstream) => {
   const profileName = args[0];
   if (!profileName) {
     throw new GSDError(
@@ -273,7 +277,7 @@ export const configSetModelProfile: QueryHandler = async (args, projectDir, _wor
   }
 
   // D6: Lock protection for read-modify-write
-  const paths = planningPaths(projectDir);
+  const paths = planningPaths(projectDir, workstream);
   const lockPath = await acquireStateLock(paths.config);
   let previousProfile = 'balanced';
   try {
@@ -317,8 +321,8 @@ export const configSetModelProfile: QueryHandler = async (args, projectDir, _wor
  * @param projectDir - Project root directory
  * @returns QueryResult with { created: true, path } or { created: false, reason }
  */
-export const configNewProject: QueryHandler = async (args, projectDir, _workstream) => {
-  const paths = planningPaths(projectDir);
+export const configNewProject: QueryHandler = async (args, projectDir, workstream) => {
+  const paths = planningPaths(projectDir, workstream);
 
   // Idempotent: don't overwrite existing config
   if (existsSync(paths.config)) {
@@ -406,22 +410,27 @@ export const configNewProject: QueryHandler = async (args, projectDir, _workstre
     ...userChoices,
     git: {
       ...(defaults.git as Record<string, unknown>),
+      ...((globalDefaults.git as Record<string, unknown>) || {}),
       ...((userChoices.git as Record<string, unknown>) || {}),
     },
     workflow: {
       ...(defaults.workflow as Record<string, unknown>),
+      ...((globalDefaults.workflow as Record<string, unknown>) || {}),
       ...((userChoices.workflow as Record<string, unknown>) || {}),
     },
     hooks: {
       ...(defaults.hooks as Record<string, unknown>),
+      ...((globalDefaults.hooks as Record<string, unknown>) || {}),
       ...((userChoices.hooks as Record<string, unknown>) || {}),
     },
     agent_skills: {
       ...((defaults.agent_skills as Record<string, unknown>) || {}),
+      ...((globalDefaults.agent_skills as Record<string, unknown>) || {}),
       ...((userChoices.agent_skills as Record<string, unknown>) || {}),
     },
     features: {
       ...((defaults.features as Record<string, unknown>) || {}),
+      ...((globalDefaults.features as Record<string, unknown>) || {}),
       ...((userChoices.features as Record<string, unknown>) || {}),
     },
   };
@@ -443,13 +452,13 @@ export const configNewProject: QueryHandler = async (args, projectDir, _workstre
  * @param projectDir - Project root directory
  * @returns QueryResult with { ensured: true, section }
  */
-export const configEnsureSection: QueryHandler = async (args, projectDir, _workstream) => {
+export const configEnsureSection: QueryHandler = async (args, projectDir, workstream) => {
   const sectionName = args[0];
   if (!sectionName) {
     throw new GSDError('Usage: config-ensure-section <section>', ErrorClassification.Validation);
   }
 
-  const paths = planningPaths(projectDir);
+  const paths = planningPaths(projectDir, workstream);
   let config: Record<string, unknown> = {};
   try {
     const raw = await readFile(paths.config, 'utf-8');

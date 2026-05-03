@@ -344,7 +344,7 @@ export const validateConsistency: QueryHandler = async (_args, projectDir, works
  * @param projectDir - Project root directory
  * @returns QueryResult with { status, errors, warnings, info, repairable_count, repairs_performed? }
  */
-export const validateHealth: QueryHandler = async (args, projectDir, _workstream) => {
+export const validateHealth: QueryHandler = async (args, projectDir, workstream) => {
   const doRepair = args.includes('--repair');
 
   // T-12-09: Home directory guard
@@ -365,13 +365,13 @@ export const validateHealth: QueryHandler = async (args, projectDir, _workstream
     };
   }
 
-  const paths = planningPaths(projectDir);
-  const planBase = join(projectDir, '.planning');
+  const paths = planningPaths(projectDir, workstream);
+  const planBase = paths.planning;
   const projectPath = join(planBase, 'PROJECT.md');
-  const roadmapPath = join(planBase, 'ROADMAP.md');
-  const statePath = join(planBase, 'STATE.md');
-  const configPath = join(planBase, 'config.json');
-  const phasesDir = join(planBase, 'phases');
+  const roadmapPath = paths.roadmap;
+  const statePath = paths.state;
+  const configPath = paths.config;
+  const phasesDir = paths.phases;
 
   interface Issue {
     code: string;
@@ -835,6 +835,62 @@ export const validateAgents: QueryHandler = async (_args, _projectDir) => {
       installed,
       missing,
       expected,
+    },
+  };
+};
+
+/**
+ * Classify the running session's context utilization against the
+ * thresholds documented in #2792:
+ *   < 60%   healthy
+ *   60–70%  warning   → recommend /gsd-thread
+ *   ≥ 70%   critical  → reasoning quality may degrade ("fracture point")
+ *
+ * Args: --tokens-used <int> --context-window <int>
+ *
+ * The model self-reports both numbers — the SDK has no privileged access
+ * to either. Recommendation copy is owned by this handler (the renderer)
+ * so it can change without touching the math layer.
+ *
+ * Mirror of get-shit-done/bin/lib/context-utilization.cjs (the legacy
+ * gsd-tools.cjs path uses the CJS module). Keep both in sync.
+ */
+function parseFlagInt(args: string[], flag: string): number | null {
+  const idx = args.indexOf(flag);
+  if (idx === -1 || idx + 1 >= args.length) return null;
+  const v = Number(args[idx + 1]);
+  return Number.isInteger(v) ? v : null;
+}
+
+const CONTEXT_RECOMMENDATIONS: Record<string, string | null> = {
+  healthy: null,
+  warning: 'Context is approaching the fracture zone — consider /gsd-thread to continue in a fresh window.',
+  critical: 'Reasoning quality may degrade past 70% utilization (fracture point). Run /gsd-thread now to preserve output quality.',
+};
+
+export const validateContext: QueryHandler = async (args, _projectDir) => {
+  const tokensUsed = parseFlagInt(args, '--tokens-used');
+  const contextWindow = parseFlagInt(args, '--context-window');
+  if (tokensUsed === null || tokensUsed < 0) {
+    throw new GSDError(
+      '--tokens-used <non-negative integer> is required for `validate.context`',
+      ErrorClassification.Validation,
+    );
+  }
+  if (contextWindow === null || contextWindow <= 0) {
+    throw new GSDError(
+      '--context-window <positive integer> is required for `validate.context`',
+      ErrorClassification.Validation,
+    );
+  }
+  const ratio = Math.min(tokensUsed / contextWindow, 1);
+  const percent = Math.min(Math.round(ratio * 100), 100);
+  const state = ratio < 0.60 ? 'healthy' : ratio < 0.70 ? 'warning' : 'critical';
+  return {
+    data: {
+      percent,
+      state,
+      recommendation: CONTEXT_RECOMMENDATIONS[state],
     },
   };
 };
