@@ -491,6 +491,20 @@ npm test -- --grep "$PHASE_TEST_PATTERN" 2>&1 | grep -q "passing"
 
 **Needs human if uncertain:** Complex wiring grep can't trace, dynamic state behavior, edge cases.
 
+**Harvest deferred items from PLAN.md (#3309 / `workflow.human_verify_mode = end-of-phase`):** Scan every PLAN file in the phase for `<verify><human-check>` blocks on `auto` tasks. These are verification items the planner deliberately deferred from `checkpoint:human-verify` to end-of-phase to avoid the executor cold-start cost. Each block has the same shape used by the planner:
+
+```xml
+<verify>
+  <human-check>
+    <test>What to do</test>
+    <expected>What should happen</expected>
+    <why_human>Why grep can't verify</why_human>
+  </human-check>
+</verify>
+```
+
+Merge those harvested items into the same human verification list as your own analysis. Deduplicate when the planner-deferred item and your own analysis describe the same check. The downstream `human_needed` → HUMAN-UAT.md path in `workflows/execute-phase.md` is the single sink — no separate file is created.
+
 **Format:**
 
 ```markdown
@@ -584,6 +598,33 @@ Deferred items are informational only — they do not require closure plans.
 **Group related gaps by concern** — if multiple truths fail from the same root cause, note this to help the planner create focused plans.
 
 </verification_process>
+
+<mvp_mode_verification>
+
+## MVP Mode Verification
+
+**When the phase under verification has `mode: mvp` in ROADMAP.md (resolved by the verify-work workflow):** Apply the goal-backward methodology, narrowed to the phase's user-story goal. Required reading: `@~/.claude/get-shit-done/references/verify-mvp-mode.md`.
+
+**Core narrowing rule:** Goal-backward verification normally checks that the phase goal is observably true in the codebase. Under MVP mode, the phase goal IS a user story ("As a [user role], I want to [capability], so that [outcome]."). Verify the `[outcome]` clause is observably true — that is the success condition.
+
+**VERIFICATION.md output structure under MVP mode:**
+
+1. Top-level "User Flow Coverage" table: each step of the user story → expected → evidence in codebase → status. (Format defined in `references/verify-mvp-mode.md`.)
+2. Standard technical-check sections (API verification, error handling, etc.) follow below — only if the user flow coverage is complete.
+
+**User Story format guard:** Apply via the centralized verb instead of inlining the regex:
+
+```bash
+USER_STORY_VALID=$(gsd-sdk query user-story.validate --story "$PHASE_GOAL" --pick valid)
+```
+
+If `valid != true`, refuse to verify. Surface the discrepancy and ask the user to run `/gsd mvp-phase ${PHASE}` to set a proper User Story goal. The verb owns the canonical regex `/^As a .+, I want to .+, so that .+\.$/` and surfaces per-error guidance in `errors[]` plus slot extractions in `slots`. Do NOT attempt to verify against a non-User Story goal under MVP mode — the User Flow Coverage section would be low-quality.
+
+**Mode is all-or-nothing per phase** (PRD decision Q1, inherited from Phase 1). The MVP Mode Verification rules apply to the whole phase or not at all.
+
+**Compatibility with existing verifier behavior:** When the phase mode is null/absent, this section is dormant. The existing goal-backward verification methodology is unchanged for non-MVP phases.
+
+</mvp_mode_verification>
 
 <output>
 

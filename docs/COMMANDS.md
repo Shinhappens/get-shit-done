@@ -6,9 +6,28 @@
 
 ## Command Syntax
 
-- **Claude Code / Gemini / Copilot:** `/gsd-command-name [args]`
-- **OpenCode / Kilo:** `/gsd-command-name [args]`
+- **Claude Code / Copilot / OpenCode / Kilo:** `/gsd-command-name [args]` (hyphen form)
+- **Gemini CLI:** `/gsd:command-name [args]` (colon form — Gemini namespaces commands under `gsd:`)
 - **Codex:** `$gsd-command-name [args]`
+
+The hyphen and colon forms are *runtime-specific spellings of the same command*. Whichever runtime you're on, the installer writes the correct form into your runtime's command directory.
+
+---
+
+## Namespace Meta-Skills
+
+Six namespace routers ship as the first-stage entry points in v1.40. They keep the eager skill-listing token cost low (~120 tokens for 6 routers vs ~2,150 for a flat 86-skill listing) while the full surface remains directly invocable. The model selects a namespace, then routes to the concrete sub-skill. See [#2792](https://github.com/gsd-build/get-shit-done/issues/2792).
+
+| Command | Routes to |
+|---------|-----------|
+| `/gsd-workflow` | Phase pipeline — discuss / plan / execute / verify / phase / progress |
+| `/gsd-project` | Project lifecycle — milestones, audits, summary |
+| `/gsd-quality` | Quality gates — code review, debug, audit, security, eval, ui |
+| `/gsd-context` | Codebase intelligence — map, graphify, docs, learnings |
+| `/gsd-manage` | Management — config, workspace, workstreams, thread, update, ship, inbox |
+| `/gsd-ideate` | Exploration & capture — explore, sketch, spike, spec, capture |
+
+The namespace skills are **additive** — every existing concrete command (e.g. `/gsd-plan-phase`, `/gsd-code-review --fix`) is still invocable directly.
 
 ---
 
@@ -78,6 +97,7 @@ Gather phase context through adaptive questioning before planning.
 | `--batch` | Group questions for batch intake instead of one-by-one |
 | `--analyze` | Add trade-off analysis during discussion |
 | `--power` | File-based bulk question answering from a prepared answers file |
+| `--assumptions` | Surface Claude's implementation assumptions about the phase without an interactive session |
 
 **Prerequisites:** `.planning/ROADMAP.md` exists
 **Produces:** `{phase}-CONTEXT.md`, `{phase}-DISCUSSION-LOG.md` (audit trail)
@@ -89,6 +109,7 @@ Gather phase context through adaptive questioning before planning.
 /gsd-discuss-phase --batch          # Batch mode for current phase
 /gsd-discuss-phase 2 --analyze      # Discussion with trade-off analysis
 /gsd-discuss-phase 1 --power        # Bulk answers from file
+/gsd-discuss-phase 3 --assumptions  # Surface Claude's assumptions before planning
 ```
 
 ---
@@ -140,6 +161,17 @@ Research, plan, and verify a phase.
 - No modifier: prompts `update / view / skip` if RESEARCH.md already exists.
 - With `--research`: force-refresh — re-spawn researcher unconditionally, no prompt.
 - With `--view`: print existing RESEARCH.md to stdout, no spawn. Errors if RESEARCH.md missing.
+
+**Package Legitimacy Gate (v1.51):**
+When the researcher recommends external packages, it runs `slopcheck install <pkg> --json` on each one and writes a `## Package Legitimacy Audit` table to RESEARCH.md recording Registry, Age, Downloads, Source Repo, and slopcheck verdict. Verdicts:
+
+- `[SLOP]` — package removed from RESEARCH.md entirely; never reaches the planner
+- `[SUS]` — package flagged; planner inserts `checkpoint:human-verify` before the install task
+- `[OK]` — package approved; no checkpoint added
+
+Packages sourced from WebSearch are tagged `[ASSUMED]` (not `[VERIFIED]`) and treated the same as `[SUS]` — they get a human checkpoint before install. If `slopcheck` cannot be installed, every recommended package is tagged `[ASSUMED]` and gated.
+
+See [Package Legitimacy Gate in the User Guide](USER-GUIDE.md#package-legitimacy-gate-v151) for the full checkpoint format, verdict table, and troubleshooting.
 
 ```bash
 /gsd-plan-phase 1                              # Research + plan + verify phase 1
@@ -205,6 +237,8 @@ Execute all plans in a phase with wave-based parallelization, or run a specific 
 
 **Prerequisites:** Phase has PLAN.md files
 **Produces:** per-plan `{phase}-{N}-SUMMARY.md`, git commits, and `{phase}-VERIFICATION.md` when the phase is fully complete
+
+**Package install failures (v1.51):** If a plan's install step fails, the executor surfaces a `checkpoint:human-verify` and stops. It does not auto-install a similarly-named alternative. This is intentional — silently substituting package names is how slopsquatting spreads. Respond to the checkpoint after verifying the package on its registry page.
 
 ```bash
 /gsd-execute-phase 1                # Execute phase 1
@@ -416,7 +450,7 @@ Show status, next steps, and automatically advance to the next logical workflow 
 | `--do "task description"` | Analyze freeform intent and dispatch to the most appropriate GSD command |
 | `--forensic` | Append a 6-check integrity audit after the standard report (STATE consistency, orphaned handoffs, deferred scope drift, memory-flagged pending work, blocking todos, uncommitted code) |
 
-**Auto-routing behavior (absorbed from `/gsd-next`):**
+**Auto-routing behavior (`--next`):**
 - No project → suggests `/gsd-new-project`
 - Phase needs discussion → runs `/gsd-discuss-phase`
 - Phase needs planning → runs `/gsd-plan-phase`
@@ -443,8 +477,13 @@ Restore full context from last session.
 
 Save context handoff when stopping mid-phase.
 
+| Flag | Description |
+|------|-------------|
+| `--report` | Generate a post-session summary in `.planning/reports/` capturing commits, file changes, and phase progress |
+
 ```bash
 /gsd-pause-work                     # Creates continue-here.md
+/gsd-pause-work --report            # Creates continue-here.md + session report
 ```
 
 ### `/gsd-manager`
@@ -461,6 +500,7 @@ Interactive command center for managing multiple phases from one terminal.
 
 ```bash
 /gsd-manager                        # Open command center dashboard
+/gsd-manager --analyze-deps         # Scan ROADMAP phases for dependency relationships before parallel execution
 ```
 
 **Checkpoint Heartbeats (#2410):**
@@ -551,13 +591,17 @@ Safe git revert — roll back GSD phase or plan commits using the phase manifest
 Ingest an external plan file into the GSD planning system with conflict detection against `PROJECT.md` decisions before writing anything.
 
 | Flag | Required | Description |
-|------|----------|-------------|
-| `--from <filepath>` | **Yes** | Path to the external plan file to import |
+|------|----------|--------------|
+| `--from <filepath>` | Yes (or `--from-gsd2`) | Path to the external plan file to import |
+| `--from-gsd2` | Yes (or `--from`) | Reverse-migrate a GSD-2 (`.gsd/`) project back to GSD v1 (`.planning/`) format |
+| `--path <dir>` | No | With `--from-gsd2`: path to the GSD-2 project directory (defaults to current directory) |
 
 **Process:** Detects conflicts → prompts for resolution → writes as GSD PLAN.md → validates via `gsd-plan-checker`
 
 ```bash
-/gsd-import --from /tmp/team-plan.md  # Import and validate an external plan
+/gsd-import --from /tmp/team-plan.md    # Import and validate an external plan
+/gsd-import --from-gsd2                # Migrate from GSD-2 back to v1 (current dir)
+/gsd-import --from-gsd2 --path ~/old-project  # Migrate from a different path
 ```
 
 ---
@@ -688,7 +732,6 @@ Generate a developer behavioral profile from Claude Code session analysis across
 
 **Generated artifacts:**
 - `USER-PROFILE.md` — Full behavioral profile
-- `/gsd-dev-preferences` command — Load preferences in any session
 - `CLAUDE.md` profile section — Auto-discovered by Claude Code
 
 ```bash
@@ -699,15 +742,19 @@ Generate a developer behavioral profile from Claude Code session analysis across
 
 ### `/gsd-health`
 
-Validate `.planning/` directory integrity.
+Validate `.planning/` directory integrity. With `--context`, probes the
+context-window utilization guard against the 60 % / 70 % thresholds (added
+v1.40.0, [#2792](https://github.com/gsd-build/get-shit-done/issues/2792)).
 
 | Flag | Description |
 |------|-------------|
 | `--repair` | Auto-fix recoverable issues |
+| `--context` | Probe context-window utilization; warns at 60 %, critical at 70 % |
 
 ```bash
 /gsd-health                         # Check integrity
 /gsd-health --repair                # Check and fix
+/gsd-health --context               # Context-utilization triage
 ```
 
 ### `/gsd-cleanup`
@@ -946,7 +993,7 @@ Build, query, and inspect the project knowledge graph stored in `.planning/graph
 
 | Subcommand | Description |
 |------------|-------------|
-| `build` | Build or rebuild the knowledge graph (spawns the graphify-builder agent) |
+| `build` | Build or rebuild the knowledge graph (runs `graphify update .` inline and refreshes `.planning/graphs/`) |
 | `query <term>` | Search the graph for a term |
 | `status` | Show graph freshness and statistics |
 | `diff` | Show changes since the last build |
