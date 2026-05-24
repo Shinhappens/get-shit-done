@@ -118,6 +118,27 @@ function gitWorktreeInfo(base: string): { inside: boolean; worktreeRoot: string 
   }
 }
 
+function detectNestedSubdir(base: string, info: { inside: boolean; worktreeRoot: string | null }): boolean {
+  if (!info.inside) return false;
+  try {
+    const prefix = execSync('git rev-parse --show-prefix', {
+      cwd: base,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      encoding: 'utf-8',
+      timeout: 5000,
+      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+    }).trim().replace(/\\/g, '/');
+    if (prefix.length > 0) return prefix !== '.' && prefix !== './';
+    return false;
+  } catch {}
+
+  if (!info.worktreeRoot) return false;
+  const normalize = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/g, '').toLowerCase();
+  const root = normalize(info.worktreeRoot);
+  const cwd = normalize(base);
+  return root !== cwd;
+}
+
 
 /**
  * Compute the canonical phase directory name for a known phase entry from the
@@ -143,16 +164,34 @@ function computeExpectedPhaseDirName(
 async function shouldDropArchivedPhaseMatch(
   phaseInfo: Record<string, unknown> | null,
   roadmapPhase: Record<string, unknown> | null,
-  _projectDir: string,
-  _workstream?: string,
+  projectDir: string,
+  workstream?: string,
 ): Promise<boolean> {
   // Matches CJS cmdInitPlanPhase / cmdInitExecutePhase / cmdInitVerifyWork:
   //   if (phaseInfo?.archived && roadmapPhase?.found) phaseInfo = null;
-  // Unconditional drop — the ROADMAP is authoritative for the current milestone,
-  // regardless of what archived milestone the on-disk match came from. Do NOT add
-  // a milestone-version equality check (#2391 regression risk).
+  // ROADMAP is authoritative for the current milestone, regardless of what
+  // archived milestone the on-disk match came from — BUT see #3469 exception.
   if (!phaseInfo?.archived) return false;
   if (!roadmapPhase || !roadmapPhase.found) return false;
+
+  // #3469: If the archived phase belongs to the CURRENT milestone (e.g. phases
+  // were cleared via `phases clear` into .planning/milestones/<version>-phases/
+  // but the workflow is still on that same milestone), preserve the archived dir
+  // as the canonical phase location. Only drop when the archived version is from
+  // a PRIOR milestone (the original anti-ghost-phase guard).
+  // Note: the milestone-version equality check here does NOT regress #2391
+  // because in the #2391 scenario archived.version != current milestone.
+  const pp = planningPaths(projectDir, workstream);
+  try {
+    const stateContent = readFileSync(pp.state, 'utf-8');
+    const milestoneMatch = stateContent.match(/^milestone:\s*(.+)$/m);
+    const currentMilestone = milestoneMatch ? milestoneMatch[1].trim() : null;
+    if (currentMilestone && phaseInfo.archived === currentMilestone) {
+      // Same milestone — archived dir is the canonical location. Keep it.
+      return false;
+    }
+  } catch { /* STATE.md unreadable — fall through to default drop */ }
+
   return true;
 }
 
@@ -181,11 +220,14 @@ function getLatestCompletedMilestone(projectDir: string): { version: string; nam
  * (`GSD_RUNTIME` → `config.runtime` → 'claude') and probes that runtime's
  * canonical `agents/` directory. `GSD_AGENTS_DIR` still short-circuits.
  *
+ * The optional `projectDir` parameter enables the repo-local `.claude/agents`
+ * fallback for Claude `--local` installs (bug #3751).
+ *
  * Port of checkAgentsInstalled from core.cjs lines 1274-1306.
  */
-function checkAgentsInstalled(config?: { runtime?: unknown }): { agents_installed: boolean; missing_agents: string[] } {
+function checkAgentsInstalled(config?: { runtime?: unknown }, projectDir?: string): { agents_installed: boolean; missing_agents: string[] } {
   const runtime = detectRuntime(config);
-  const agentsDir = resolveAgentsDir(runtime);
+  const agentsDir = resolveAgentsDir(runtime, projectDir);
   const expectedAgents = Object.keys(MODEL_PROFILES);
 
   if (!existsSync(agentsDir)) {
@@ -330,7 +372,7 @@ export function withProjectRoot(
 ): Record<string, unknown> {
   result.project_root = projectDir;
 
-  const agentStatus = checkAgentsInstalled(config);
+  const agentStatus = checkAgentsInstalled(config, projectDir);
   result.agents_installed = agentStatus.agents_installed;
   result.missing_agents = agentStatus.missing_agents;
 
@@ -1278,16 +1320,14 @@ export const initRemoveWorkspace: QueryHandler = async (args, _projectDir) => {
  */
 export const initIngestDocs: QueryHandler = async (_args, projectDir) => {
   const config = await loadConfig(projectDir);
+  const gitInfo = gitWorktreeInfo(projectDir);
   const result: Record<string, unknown> = {
     project_exists: pathExists(projectDir, '.planning/PROJECT.md'),
     planning_exists: pathExists(projectDir, '.planning'),
     // Bug #3491: detect parent worktree to avoid nested .git init.
-    has_git: (() => gitWorktreeInfo(projectDir).inside)(),
-    git_worktree_root: (() => gitWorktreeInfo(projectDir).worktreeRoot)(),
-    in_nested_subdir: (() => {
-      const info = gitWorktreeInfo(projectDir);
-      return info.inside && info.worktreeRoot !== null && info.worktreeRoot !== projectDir;
-    })(),
+    has_git: gitInfo.inside,
+    git_worktree_root: gitInfo.worktreeRoot,
+    in_nested_subdir: detectNestedSubdir(projectDir, gitInfo),
     project_path: '.planning/PROJECT.md',
     commit_docs: config.commit_docs,
   };
